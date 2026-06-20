@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace klee {
@@ -65,6 +66,18 @@ struct StackFrame {
   StackFrame(KInstIterator caller, KFunction *kf);
   StackFrame(const StackFrame &s);
   ~StackFrame();
+};
+
+struct ClosedBoxCall {
+  struct Arg {
+    std::string arrayName;
+    Expr::Width width;
+  };
+
+  std::string functionName;
+  std::string resultArrayName;
+  Expr::Width resultWidth;
+  std::vector<Arg> args;
 };
 
 /// Contains information related to unwinding (Itanium ABI/2-Phase unwinding)
@@ -215,6 +228,9 @@ public:
   //
   // FIXME: Move to a shared list structure (not critical).
   std::vector<std::pair<ref<const MemoryObject>, const Array *>> symbolics;
+
+  /// @brief Scalar closed-box calls that should be emitted as SMT UFs.
+  std::vector<ClosedBoxCall> closedBoxCalls;
 
   /// @brief A set of boolean expressions
   /// the user has requested be true of a counterexample.

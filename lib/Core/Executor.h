@@ -314,6 +314,15 @@ private:
                    std::vector< ref<Expr> > &arguments);
 
   void logCallInstruction(KInstruction *ki, llvm::Function *f);
+  bool executeClosedBoxCall(ExecutionState &state, KInstruction *ki,
+                            llvm::Function *f,
+                            std::vector<ref<Expr>> &arguments);
+  ref<Expr> makeClosedBoxSymbolicScalar(ExecutionState &state,
+                                        KInstruction *ki,
+                                        const std::string &name,
+                                        Expr::Width width,
+                                        std::string &arrayName);
+  void injectClosedBoxSMT(const ExecutionState &state, std::string &smt) const;
                    
   // do address resolution / object binding / out of bounds checking
   // and perform the operation

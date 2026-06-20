@@ -472,6 +472,11 @@ cl::opt<bool> DebugCheckForImpliedValues(
     cl::desc("Debug the implied value optimization"),
     cl::cat(DebugCat));
 
+cl::list<std::string> ClosedBoxFunctions(
+    "smt-closed-box-functions",
+    cl::desc("Comma-separated scalar functions to encode as SMT UFs"),
+    cl::CommaSeparated, cl::cat(DebugCat));
+
 } // namespace
 
 // XXX hack
@@ -1749,6 +1754,189 @@ void Executor::logCallInstruction(KInstruction *ki, Function *f) {
   smtFunctionLogFile->flush();
 }
 
+static bool isClosedBoxSMTScalarType(Type *type, Expr::Width width) {
+  return type->isIntegerTy() && width != Expr::Bool && width % 8 == 0;
+}
+
+static std::string escapeSMTSymbol(StringRef name) {
+  std::string result = "|";
+  for (char c : name) {
+    if (c == '\\' || c == '|')
+      result += '\\';
+    result += c;
+  }
+  result += '|';
+  return result;
+}
+
+static std::string getClosedBoxArrayBVTerm(const std::string &arrayName,
+                                           Expr::Width width) {
+  assert(width % 8 == 0 && "closed-box scalar width must be byte aligned");
+  unsigned bytes = width / 8;
+
+  auto selectByte = [&](unsigned index) {
+    std::string result;
+    llvm::raw_string_ostream os(result);
+    os << "(select " << arrayName << " (_ bv" << index << " 32))";
+    return os.str();
+  };
+
+  std::string result = selectByte(bytes - 1);
+  for (int i = bytes - 2; i >= 0; --i) {
+    std::string tmp;
+    llvm::raw_string_ostream os(tmp);
+    os << "(concat " << result << " " << selectByte(i) << ")";
+    result = os.str();
+  }
+  return result;
+}
+
+static bool hasSMTArrayDeclaration(const std::string &smt,
+                                   const std::string &arrayName) {
+  return smt.find("(declare-fun " + arrayName + " ") != std::string::npos;
+}
+
+ref<Expr> Executor::makeClosedBoxSymbolicScalar(ExecutionState &state,
+                                                KInstruction *ki,
+                                                const std::string &name,
+                                                Expr::Width width,
+                                                std::string &arrayName) {
+  assert(width % 8 == 0 && "closed-box scalar width must be byte aligned");
+  uint64_t bytes = width / 8;
+
+  MemoryObject *mo = memory->allocate(bytes, /*isLocal=*/false,
+                                      /*isGlobal=*/false, &state, ki->inst,
+                                      /*alignment=*/8);
+  if (!mo) {
+    terminateStateOnExecError(state, "unable to allocate closed-box scalar");
+    return nullptr;
+  }
+
+  unsigned id = 0;
+  arrayName = name;
+  while (!state.arrayNames.insert(arrayName).second)
+    arrayName = name + "_" + llvm::utostr(++id);
+
+  mo->setName(arrayName);
+  const Array *array = arrayCache.CreateArray(arrayName, bytes);
+  ObjectState *os = bindObjectInState(state, mo, false, array);
+  state.addSymbolic(mo, array);
+  return os->read(0, width);
+}
+
+bool Executor::executeClosedBoxCall(ExecutionState &state, KInstruction *ki,
+                                    Function *f,
+                                    std::vector<ref<Expr>> &arguments) {
+  if (!f || ClosedBoxFunctions.empty())
+    return false;
+
+  if (std::find(ClosedBoxFunctions.begin(), ClosedBoxFunctions.end(),
+                f->getName().str()) == ClosedBoxFunctions.end())
+    return false;
+
+  const auto &cb = cast<CallBase>(*ki->inst);
+  Type *resultType = cb.getType();
+  Expr::Width resultWidth = getWidthForLLVMType(resultType);
+  if (!isClosedBoxSMTScalarType(resultType, resultWidth)) {
+    klee_warning_once(f, "not treating %s as closed-box: return is not a "
+                         "byte-aligned integer scalar",
+                      f->getName().str().c_str());
+    return false;
+  }
+
+  for (unsigned i = 0; i < cb.arg_size(); ++i) {
+    Expr::Width width = arguments[i]->getWidth();
+    if (!isClosedBoxSMTScalarType(cb.getArgOperand(i)->getType(), width)) {
+      klee_warning_once(f, "not treating %s as closed-box: argument is not a "
+                           "byte-aligned integer scalar",
+                        f->getName().str().c_str());
+      return false;
+    }
+  }
+
+  std::string baseName =
+      "closed_box_" + f->getName().str() + "_" +
+      llvm::utostr(state.closedBoxCalls.size());
+
+  ClosedBoxCall call;
+  call.functionName = f->getName().str();
+  call.resultWidth = resultWidth;
+
+  for (unsigned i = 0; i < arguments.size(); ++i) {
+    std::string argName;
+    ref<Expr> argMarker = makeClosedBoxSymbolicScalar(
+        state, ki, baseName + "_arg" + llvm::utostr(i), arguments[i]->getWidth(),
+        argName);
+    if (!argMarker)
+      return true;
+
+    addConstraint(state, EqExpr::create(argMarker, arguments[i]));
+    call.args.push_back({argName, arguments[i]->getWidth()});
+  }
+
+  std::string resultName;
+  ref<Expr> result = makeClosedBoxSymbolicScalar(
+      state, ki, baseName + "_ret", resultWidth, resultName);
+  if (!result)
+    return true;
+
+  call.resultArrayName = resultName;
+  state.closedBoxCalls.push_back(call);
+  bindLocal(ki, state, result);
+  return true;
+}
+
+void Executor::injectClosedBoxSMT(const ExecutionState &state,
+                                  std::string &smt) const {
+  if (state.closedBoxCalls.empty())
+    return;
+
+  std::string block;
+  llvm::raw_string_ostream os(block);
+  os << "\n; closed-box scalar calls\n";
+
+  std::set<std::string> declaredFunctions;
+  for (const ClosedBoxCall &call : state.closedBoxCalls) {
+    auto declareArray = [&](const std::string &name) {
+      if (!hasSMTArrayDeclaration(smt, name))
+        os << "(declare-fun " << name
+           << " () (Array (_ BitVec 32) (_ BitVec 8)))\n";
+    };
+
+    for (const auto &arg : call.args)
+      declareArray(arg.arrayName);
+    declareArray(call.resultArrayName);
+
+    std::string signature = call.functionName + ":" +
+                            llvm::utostr(call.resultWidth);
+    for (const auto &arg : call.args)
+      signature += ":" + llvm::utostr(arg.width);
+
+    if (declaredFunctions.insert(signature).second) {
+      os << "(declare-fun " << escapeSMTSymbol(call.functionName) << " (";
+      for (unsigned i = 0; i < call.args.size(); ++i) {
+        if (i)
+          os << " ";
+        os << "(_ BitVec " << call.args[i].width << ")";
+      }
+      os << ") (_ BitVec " << call.resultWidth << "))\n";
+    }
+
+    os << "(assert (= "
+       << getClosedBoxArrayBVTerm(call.resultArrayName, call.resultWidth)
+       << " (" << escapeSMTSymbol(call.functionName);
+    for (const auto &arg : call.args)
+      os << " " << getClosedBoxArrayBVTerm(arg.arrayName, arg.width);
+    os << ")))\n";
+  }
+
+  size_t pos = smt.rfind("(check-sat)");
+  if (pos == std::string::npos)
+    smt += os.str();
+  else
+    smt.insert(pos, os.str());
+}
+
 void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
                            std::vector<ref<Expr>> &arguments) {
   Instruction *i = ki->inst;
@@ -2554,7 +2742,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       }
 
       logCallInstruction(ki, f);
-      executeCall(state, ki, f, arguments);
+      if (!executeClosedBoxCall(state, ki, f, arguments))
+        executeCall(state, ki, f, arguments);
     } else {
       ref<Expr> v = eval(ki, 0, state).value;
 
@@ -2585,7 +2774,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
                                 f->getName().data());
 
             logCallInstruction(ki, f);
-            executeCall(*res.first, ki, f, arguments);
+            if (!executeClosedBoxCall(*res.first, ki, f, arguments))
+              executeCall(*res.first, ki, f, arguments);
           } else {
             if (!hasInvalid) {
               terminateStateOnExecError(state, "invalid function pointer");
@@ -4866,10 +5056,11 @@ void Executor::getConstraintLog(const ExecutionState &state, std::string &res,
     ExprSMTLIBPrinter printer;
     printer.setOutput(info);
     Query query(state.constraints, ConstantExpr::alloc(0, Expr::Bool));
-    printer.setQuery(query);
-    printer.generateOutput();
-    res = info.str();
-  } break;
+	    printer.setQuery(query);
+	    printer.generateOutput();
+	    res = info.str();
+	    injectClosedBoxSMT(state, res);
+	  } break;
 
   default:
     klee_warning("Executor::getConstraintLog() : Log format not supported!");
