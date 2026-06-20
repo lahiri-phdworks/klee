@@ -1759,6 +1759,12 @@ static bool isClosedBoxSMTScalarType(Type *type, Expr::Width width) {
   return type->isIntegerTy() && width != Expr::Bool && width % 8 == 0;
 }
 
+struct ClosedBoxResolvedPointerArg {
+  unsigned argIndex;
+  const MemoryObject *mo;
+  const ObjectState *os;
+};
+
 static std::string escapeSMTSymbol(StringRef name) {
   std::string result = "|";
   for (char c : name) {
@@ -1838,21 +1844,75 @@ bool Executor::executeClosedBoxCall(ExecutionState &state, KInstruction *ki,
   const auto &cb = cast<CallBase>(*ki->inst);
   Type *resultType = cb.getType();
   Expr::Width resultWidth = getWidthForLLVMType(resultType);
-  if (!isClosedBoxSMTScalarType(resultType, resultWidth)) {
-    klee_warning_once(f, "not treating %s as closed-box: return is not a "
-                         "byte-aligned integer scalar",
-                      f->getName().str().c_str());
-    return false;
-  }
 
+  std::vector<ClosedBoxResolvedPointerArg> pointerArgs;
   for (unsigned i = 0; i < cb.arg_size(); ++i) {
+    Type *argType = cb.getArgOperand(i)->getType();
     Expr::Width width = arguments[i]->getWidth();
-    if (!isClosedBoxSMTScalarType(cb.getArgOperand(i)->getType(), width)) {
+
+    if (isClosedBoxSMTScalarType(argType, width))
+      continue;
+
+    if (!argType->isPointerTy()) {
       klee_warning_once(f, "not treating %s as closed-box: argument is not a "
-                           "byte-aligned integer scalar",
+                           "supported scalar or pointer buffer",
                         f->getName().str().c_str());
       return false;
     }
+
+    ObjectPair op;
+    bool success = false;
+    solver->setTimeout(coreSolverTimeout);
+    bool resolved =
+        state.addressSpace.resolveOne(state, solver.get(), arguments[i], op,
+                                      success);
+    solver->setTimeout(time::Span());
+    if (!resolved || !success) {
+      klee_warning_once(f, "not treating %s as closed-box: pointer argument "
+                           "could not be resolved to a single object",
+                        f->getName().str().c_str());
+      return false;
+    }
+
+    ref<Expr> offset = op.first->getOffsetExpr(arguments[i]);
+    ref<Expr> isBase =
+        EqExpr::create(offset, ConstantExpr::alloc(0, offset->getWidth()));
+    bool atBase = false;
+    solver->setTimeout(coreSolverTimeout);
+    success =
+        solver->mustBeTrue(state.constraints, isBase, atBase, state.queryMetaData);
+    solver->setTimeout(time::Span());
+    if (!success || !atBase) {
+      klee_warning_once(f, "not treating %s as closed-box: pointer argument "
+                           "must refer to the base of a single object",
+                        f->getName().str().c_str());
+      return false;
+    }
+
+    if (op.first->size == 0 || op.second->readOnly) {
+      klee_warning_once(f, "not treating %s as closed-box: pointer argument "
+                           "must refer to a writable non-empty object",
+                        f->getName().str().c_str());
+      return false;
+    }
+
+    pointerArgs.push_back({i, op.first, op.second});
+  }
+
+  bool resultIsScalar = isClosedBoxSMTScalarType(resultType, resultWidth);
+  bool resultIsPointer = resultType->isPointerTy();
+  if (!resultIsScalar && !resultIsPointer) {
+    klee_warning_once(f, "not treating %s as closed-box: unsupported return "
+                         "type",
+                      f->getName().str().c_str());
+    return false;
+  }
+  if (resultIsPointer && pointerArgs.size() != 1) {
+    klee_warning_once(
+        f, "not treating %s as closed-box: pointer return requires exactly "
+           "one pointer argument",
+        f->getName().str().c_str());
+    return false;
   }
 
   std::string baseName =
@@ -1860,10 +1920,12 @@ bool Executor::executeClosedBoxCall(ExecutionState &state, KInstruction *ki,
       llvm::utostr(state.closedBoxCalls.size());
 
   ClosedBoxCall call;
-  call.functionName = f->getName().str();
-  call.resultWidth = resultWidth;
 
   for (unsigned i = 0; i < arguments.size(); ++i) {
+    Type *argType = cb.getArgOperand(i)->getType();
+    if (argType->isPointerTy())
+      continue;
+
     std::string argName;
     ref<Expr> argMarker = makeClosedBoxSymbolicScalar(
         state, ki, baseName + "_arg" + llvm::utostr(i), arguments[i]->getWidth(),
@@ -1872,18 +1934,71 @@ bool Executor::executeClosedBoxCall(ExecutionState &state, KInstruction *ki,
       return true;
 
     addConstraint(state, EqExpr::create(argMarker, arguments[i]));
-    call.args.push_back({argName, arguments[i]->getWidth()});
+    call.inputs.push_back({argName, arguments[i]->getWidth()});
   }
 
-  std::string resultName;
-  ref<Expr> result = makeClosedBoxSymbolicScalar(
-      state, ki, baseName + "_ret", resultWidth, resultName);
-  if (!result)
-    return true;
+  for (const auto &pointerArg : pointerArgs) {
+    for (size_t byte = 0; byte < pointerArg.mo->size; ++byte) {
+      std::string inputName;
+      ref<Expr> inputMarker = makeClosedBoxSymbolicScalar(
+          state, ki,
+          baseName + "_arg" + llvm::utostr(pointerArg.argIndex) + "_in" +
+              llvm::utostr(byte),
+          Expr::Int8, inputName);
+      if (!inputMarker)
+        return true;
 
-  call.resultArrayName = resultName;
+      addConstraint(state, EqExpr::create(inputMarker, pointerArg.os->read8(byte)));
+      call.inputs.push_back({inputName, Expr::Int8});
+    }
+  }
+
+  for (const auto &pointerArg : pointerArgs) {
+    ObjectState *wos =
+        state.addressSpace.getWriteable(pointerArg.mo, pointerArg.os);
+    for (size_t byte = 0; byte < pointerArg.mo->size; ++byte) {
+      std::string outputName;
+      ref<Expr> outputMarker = makeClosedBoxSymbolicScalar(
+          state, ki,
+          baseName + "_arg" + llvm::utostr(pointerArg.argIndex) + "_out" +
+              llvm::utostr(byte),
+          Expr::Int8, outputName);
+      if (!outputMarker)
+        return true;
+
+      wos->write(byte, outputMarker);
+      call.outputs.push_back(
+          {f->getName().str() + "$arg" + llvm::utostr(pointerArg.argIndex) +
+               "_byte" + llvm::utostr(byte),
+           outputName, Expr::Int8});
+    }
+  }
+
+  if (resultIsScalar) {
+    std::string resultName;
+    ref<Expr> result = makeClosedBoxSymbolicScalar(
+        state, ki, baseName + "_ret", resultWidth, resultName);
+    if (!result)
+      return true;
+
+    call.outputs.push_back({f->getName().str(), resultName, resultWidth});
+    bindLocal(ki, state, result);
+  } else {
+    const MemoryObject *retObject = pointerArgs.front().mo;
+    std::string resultName;
+    ref<Expr> resultOffset = makeClosedBoxSymbolicScalar(
+        state, ki, baseName + "_ret_offset", resultWidth, resultName);
+    if (!resultOffset)
+      return true;
+
+    addConstraint(state, retObject->getBoundsCheckOffset(resultOffset));
+    call.outputs.push_back(
+        {f->getName().str() + "$ret", resultName, resultWidth});
+    bindLocal(ki, state,
+              AddExpr::create(retObject->getBaseExpr(), resultOffset));
+  }
+
   state.closedBoxCalls.push_back(call);
-  bindLocal(ki, state, result);
   return true;
 }
 
@@ -1904,31 +2019,34 @@ void Executor::injectClosedBoxSMT(const ExecutionState &state,
            << " () (Array (_ BitVec 32) (_ BitVec 8)))\n";
     };
 
-    for (const auto &arg : call.args)
-      declareArray(arg.arrayName);
-    declareArray(call.resultArrayName);
+    for (const auto &input : call.inputs)
+      declareArray(input.arrayName);
+    for (const auto &output : call.outputs)
+      declareArray(output.arrayName);
 
-    std::string signature = call.functionName + ":" +
-                            llvm::utostr(call.resultWidth);
-    for (const auto &arg : call.args)
-      signature += ":" + llvm::utostr(arg.width);
+    for (const auto &output : call.outputs) {
+      std::string signature =
+          output.functionName + ":" + llvm::utostr(output.width);
+      for (const auto &input : call.inputs)
+        signature += ":" + llvm::utostr(input.width);
 
-    if (declaredFunctions.insert(signature).second) {
-      os << "(declare-fun " << escapeSMTSymbol(call.functionName) << " (";
-      for (unsigned i = 0; i < call.args.size(); ++i) {
-        if (i)
-          os << " ";
-        os << "(_ BitVec " << call.args[i].width << ")";
+      if (declaredFunctions.insert(signature).second) {
+        os << "(declare-fun " << escapeSMTSymbol(output.functionName) << " (";
+        for (unsigned i = 0; i < call.inputs.size(); ++i) {
+          if (i)
+            os << " ";
+          os << "(_ BitVec " << call.inputs[i].width << ")";
+        }
+        os << ") (_ BitVec " << output.width << "))\n";
       }
-      os << ") (_ BitVec " << call.resultWidth << "))\n";
-    }
 
-    os << "(assert (= "
-       << getClosedBoxArrayBVTerm(call.resultArrayName, call.resultWidth)
-       << " (" << escapeSMTSymbol(call.functionName);
-    for (const auto &arg : call.args)
-      os << " " << getClosedBoxArrayBVTerm(arg.arrayName, arg.width);
-    os << ")))\n";
+      os << "(assert (= "
+         << getClosedBoxArrayBVTerm(output.arrayName, output.width) << " ("
+         << escapeSMTSymbol(output.functionName);
+      for (const auto &input : call.inputs)
+        os << " " << getClosedBoxArrayBVTerm(input.arrayName, input.width);
+      os << ")))\n";
+    }
   }
 
   size_t pos = smt.rfind("(check-sat)");

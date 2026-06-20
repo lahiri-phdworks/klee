@@ -69,15 +69,19 @@ struct StackFrame {
 };
 
 struct ClosedBoxCall {
-  struct Arg {
+  struct Value {
     std::string arrayName;
     Expr::Width width;
   };
 
-  std::string functionName;
-  std::string resultArrayName;
-  Expr::Width resultWidth;
-  std::vector<Arg> args;
+  struct Output {
+    std::string functionName;
+    std::string arrayName;
+    Expr::Width width;
+  };
+
+  std::vector<Value> inputs;
+  std::vector<Output> outputs;
 };
 
 /// Contains information related to unwinding (Itanium ABI/2-Phase unwinding)
