@@ -1765,7 +1765,29 @@ struct ClosedBoxResolvedPointerArg {
   const ObjectState *os;
 };
 
-static std::string escapeSMTSymbol(StringRef name) {
+static bool isSimpleSMTSymbol(StringRef name) {
+  if (name.empty())
+    return false;
+
+  auto isValidChar = [](char c) {
+    return llvm::isAlnum(c) || c == '_';
+  };
+
+  if (!(llvm::isAlpha(name.front()) || name.front() == '_'))
+    return false;
+
+  for (char c : name) {
+    if (!isValidChar(c))
+      return false;
+  }
+
+  return true;
+}
+
+static std::string renderSMTSymbol(StringRef name) {
+  if (isSimpleSMTSymbol(name))
+    return name.str();
+
   std::string result = "|";
   for (char c : name) {
     if (c == '\\' || c == '|')
@@ -1774,6 +1796,18 @@ static std::string escapeSMTSymbol(StringRef name) {
   }
   result += '|';
   return result;
+}
+
+static std::string getClosedBoxUFName(StringRef functionName,
+                                      StringRef suffix = "") {
+  std::string stem = functionName.str();
+  if (stem.size() >= 3 && stem.substr(stem.size() - 3) == "_cb")
+    stem.resize(stem.size() - 3);
+
+  if (!suffix.empty())
+    return stem + "_" + suffix.str() + "_cb";
+
+  return stem + "_cb";
 }
 
 static std::string getClosedBoxArrayBVTerm(const std::string &arrayName,
@@ -1968,8 +2002,9 @@ bool Executor::executeClosedBoxCall(ExecutionState &state, KInstruction *ki,
 
       wos->write(byte, outputMarker);
       call.outputs.push_back(
-          {f->getName().str() + "$arg" + llvm::utostr(pointerArg.argIndex) +
-               "_byte" + llvm::utostr(byte),
+          {getClosedBoxUFName(f->getName(),
+                              "arg" + llvm::utostr(pointerArg.argIndex) +
+                                  "_byte" + llvm::utostr(byte)),
            outputName, Expr::Int8});
     }
   }
@@ -1981,7 +2016,8 @@ bool Executor::executeClosedBoxCall(ExecutionState &state, KInstruction *ki,
     if (!result)
       return true;
 
-    call.outputs.push_back({f->getName().str(), resultName, resultWidth});
+    call.outputs.push_back(
+        {getClosedBoxUFName(f->getName()), resultName, resultWidth});
     bindLocal(ki, state, result);
   } else {
     const MemoryObject *retObject = pointerArgs.front().mo;
@@ -1992,8 +2028,8 @@ bool Executor::executeClosedBoxCall(ExecutionState &state, KInstruction *ki,
       return true;
 
     addConstraint(state, retObject->getBoundsCheckOffset(resultOffset));
-    call.outputs.push_back(
-        {f->getName().str() + "$ret", resultName, resultWidth});
+    call.outputs.push_back({getClosedBoxUFName(f->getName(), "ret"), resultName,
+                            resultWidth});
     bindLocal(ki, state,
               AddExpr::create(retObject->getBaseExpr(), resultOffset));
   }
@@ -2031,7 +2067,7 @@ void Executor::injectClosedBoxSMT(const ExecutionState &state,
         signature += ":" + llvm::utostr(input.width);
 
       if (declaredFunctions.insert(signature).second) {
-        os << "(declare-fun " << escapeSMTSymbol(output.functionName) << " (";
+        os << "(declare-fun " << renderSMTSymbol(output.functionName) << " (";
         for (unsigned i = 0; i < call.inputs.size(); ++i) {
           if (i)
             os << " ";
@@ -2042,7 +2078,7 @@ void Executor::injectClosedBoxSMT(const ExecutionState &state,
 
       os << "(assert (= "
          << getClosedBoxArrayBVTerm(output.arrayName, output.width) << " ("
-         << escapeSMTSymbol(output.functionName);
+         << renderSMTSymbol(output.functionName);
       for (const auto &input : call.inputs)
         os << " " << getClosedBoxArrayBVTerm(input.arrayName, input.width);
       os << ")))\n";
