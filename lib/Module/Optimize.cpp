@@ -24,5 +24,13 @@ void klee::optimiseAndPrepare(bool OptimiseKLEECall, bool Optimize,
                               SwitchImplType SwitchType, std::string EntryPoint,
                               llvm::ArrayRef<const char *> preservedFunctions,
                               llvm::Module *module) {
-  assert(0);
+  (void)OptimiseKLEECall;
+  (void)Optimize;
+  (void)SwitchType;
+  (void)preservedFunctions;
+
+  // The legacy optimization pipeline uses pass factory APIs that were removed
+  // in newer LLVM releases. Keep the required module preparation step here so
+  // LLVM 17+ builds can execute modules instead of aborting on this stub.
+  injectStaticConstructorsAndDestructors(module, EntryPoint);
 }

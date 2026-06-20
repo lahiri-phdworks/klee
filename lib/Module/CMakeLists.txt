@@ -28,7 +28,7 @@ if ("${LLVM_VERSION_MAJOR}" LESS 17)
   )
 else ()
   LIST(APPEND KLEE_MODULE_COMPONENT_SRCS
-          Instrument.cpp
+          InstrumentLegacy.cpp
           Optimize.cpp
   )
 endif ()

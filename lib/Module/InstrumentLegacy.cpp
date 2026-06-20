@@ -9,6 +9,7 @@
 #include "ModuleHelper.h"
 
 #include "Passes.h"
+#include "klee/Config/Version.h"
 #include "klee/Support/CompilerWarning.h"
 #include "klee/Support/ErrorHandling.h"
 
@@ -39,7 +40,9 @@ void klee::instrument(bool CheckDivZero, bool CheckOvershift,
   // optimize is seeing what is as close as possible to the final
   // module.
   legacy::PassManager pm;
+#if LLVM_VERSION_CODE < LLVM_VERSION(17, 0)
   pm.add(new RaiseAsmPass());
+#endif
 
   // This pass will scalarize as much code as possible so that the Executor
   // does not need to handle operands of vector type for most instructions
@@ -56,7 +59,7 @@ void klee::instrument(bool CheckDivZero, bool CheckOvershift,
   if (CheckOvershift)
     pm.add(new OvershiftCheckPass());
 
-  llvm::DataLayout targetData(module);
+  llvm::DataLayout targetData(module->getDataLayout());
   pm.add(new IntrinsicCleanerPass(targetData));
   pm.run(*module);
 }
@@ -79,6 +82,7 @@ void klee::checkModule(bool DontVerify, llvm::Module *module) {
   }
 }
 
+#if LLVM_VERSION_CODE < LLVM_VERSION(17, 0)
 void klee::optimiseAndPrepare(bool OptimiseKLEECall, bool Optimize,
                               SwitchImplType SwitchType, std::string EntryPoint,
                               llvm::ArrayRef<const char *> preservedFunctions,
@@ -116,10 +120,11 @@ void klee::optimiseAndPrepare(bool OptimiseKLEECall, bool Optimize,
     break;
   }
 
-  llvm::DataLayout targetData(module);
+  llvm::DataLayout targetData(module->getDataLayout());
   pm3.add(new IntrinsicCleanerPass(targetData));
   pm3.add(createScalarizerPass());
   pm3.add(new PhiCleanerPass());
   pm3.add(new FunctionAliasPass());
   pm3.run(*module);
 }
+#endif

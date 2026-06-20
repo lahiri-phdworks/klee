@@ -538,6 +538,10 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
                  error.c_str());
     }
   }
+
+  smtFunctionLogFile = interpreterHandler->openOutputFile("smt-func.log");
+  if (!smtFunctionLogFile)
+    klee_error("Unable to open SMT function call log file (smt-func.log).");
 }
 
 llvm::Module *
@@ -1706,6 +1710,45 @@ ref<klee::ConstantExpr> Executor::getEhTypeidFor(ref<Expr> type_info) {
   return res;
 }
 
+static std::string getSMTFuncOperandName(const Value *value) {
+  if (value->hasName())
+    return value->getName().str();
+
+  std::string result;
+  llvm::raw_string_ostream os(result);
+  value->printAsOperand(os, false);
+  return os.str();
+}
+
+void Executor::logCallInstruction(KInstruction *ki, Function *f) {
+  if (!smtFunctionLogFile)
+    return;
+
+  const auto &cb = cast<CallBase>(*ki->inst);
+  const bool hasReturnValue =
+      cb.getType() != Type::getVoidTy(cb.getContext()) && !cb.use_empty();
+
+  if (hasReturnValue)
+    *smtFunctionLogFile << getSMTFuncOperandName(&cb) << " = ";
+
+  if (f) {
+    *smtFunctionLogFile << f->getName();
+  } else if (isa<InlineAsm>(cb.getCalledOperand())) {
+    *smtFunctionLogFile << "inline_asm";
+  } else {
+    *smtFunctionLogFile << getSMTFuncOperandName(cb.getCalledOperand());
+  }
+
+  *smtFunctionLogFile << "(";
+  for (unsigned j = 0; j < cb.arg_size(); ++j) {
+    if (j)
+      *smtFunctionLogFile << ", ";
+    *smtFunctionLogFile << getSMTFuncOperandName(cb.getArgOperand(j));
+  }
+  *smtFunctionLogFile << ")\n";
+  smtFunctionLogFile->flush();
+}
+
 void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
                            std::vector<ref<Expr>> &arguments) {
   Instruction *i = ki->inst;
@@ -2460,6 +2503,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       arguments.push_back(eval(ki, j+1, state).value);
 
     if (auto* asmValue = dyn_cast<InlineAsm>(fp)) { //TODO: move to `executeCall`
+      logCallInstruction(ki, nullptr);
       if (ExternalCalls != ExternalCallPolicy::None) {
         KInlineAsm callable(asmValue);
         callExternalFunction(state, ki, &callable, arguments);
@@ -2509,6 +2553,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         }
       }
 
+      logCallInstruction(ki, f);
       executeCall(state, ki, f, arguments);
     } else {
       ref<Expr> v = eval(ki, 0, state).value;
@@ -2539,6 +2584,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
                                 "resolved symbolic function pointer to: %s",
                                 f->getName().data());
 
+            logCallInstruction(ki, f);
             executeCall(*res.first, ki, f, arguments);
           } else {
             if (!hasInvalid) {

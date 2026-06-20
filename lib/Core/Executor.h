@@ -44,6 +44,7 @@ struct KTest;
 namespace llvm {
   class BasicBlock;
   class BranchInst;
+  class CallBase;
   class CallInst;
   class LandingPadInst;
   class Constant;
@@ -114,6 +115,7 @@ private:
   std::set<ExecutionState*, ExecutionStateIDCompare> states;
   StatsTracker *statsTracker;
   TreeStreamWriter *pathWriter, *symPathWriter;
+  std::unique_ptr<llvm::raw_fd_ostream> smtFunctionLogFile;
   SpecialFunctionHandler *specialFunctionHandler;
   TimerGroup timers;
   std::unique_ptr<ExecutionTree> executionTree;
@@ -310,6 +312,8 @@ private:
                    KInstruction *ki,
                    llvm::Function *f,
                    std::vector< ref<Expr> > &arguments);
+
+  void logCallInstruction(KInstruction *ki, llvm::Function *f);
                    
   // do address resolution / object binding / out of bounds checking
   // and perform the operation
